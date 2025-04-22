@@ -1,0 +1,280 @@
+---
+title: "proj5"
+author: "Jiayi Shi"
+date: "2025-04-18"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+warning = FALSE,
+message=F,
+fig.width = 6,
+fig.asp = .6,
+out.width = "90%")
+library(tidyverse)
+library(table1)
+library(gtsummary)
+library(knitr)
+library(patchwork)
+
+library(readxl)
+library(geepack)
+library(glmmTMB)
+library(lme4)
+library(lmerTest)
+```
+
+# Load data & EDA
+
+```{r}
+data <- read_excel("data.xlsx") %>% 
+  janitor::clean_names() %>% 
+  mutate(group = factor(group, levels = c(0,1), labels = c("Control", "Intervention")), time = factor(time), school = factor(school))
+
+table1::table1(~sfd|group, data, overall = F)
+table1::table1(~school|group, data %>% distinct(id, .keep_all = T), overall = F)
+
+ggplot(data, aes(x = time, y = sfd, fill = group)) +
+  geom_boxplot() +
+  labs(x = "Time", y = "SFD") +
+  scale_y_discrete(limits=1:14) +
+  scale_fill_discrete(name = "Group", labels = c("Control", "Intervention"))+
+  theme_bw()
+
+#summarized_data <- aggregate(sfd ~ time + group, data, mean)
+
+
+miss = data %>% filter(is.na(sfd))
+library(naniar)
+mcar_test(data) #MAR/MNAR
+
+# change sfd
+df <- data %>%
+  pivot_wider(names_from = time, values_from = sfd, names_prefix = "sfd_") %>%
+  mutate(
+    sfd_6mo = sfd_2 - sfd_1,
+    sfd_12mo = sfd_3 - sfd_1
+  ) %>% 
+  select(id, group, school, sfd_6mo, sfd_12mo) 
+
+d <- df %>% 
+  pivot_longer(c(sfd_6mo, sfd_12mo), names_to = "time", values_to = "change_sfd", names_prefix = "sfd_") %>% 
+  mutate(time = factor(time, levels = c("6mo", "12mo"), labels = c("6-month", "12-month")))
+
+
+# A model of nested random effects (block within site) could be 1|site/block if block labels are reused across multiple sites, or (1|site)+ (1|block) if the nesting structure is explicit in the data and each level of block only occurs within one site. A model of crossed random effects (block and year) would be (1|block)+(1|year).
+
+#lmm = glmmTMB(change_sfd~time*group+(1|school/id), df)
+#summary(lmm)
+#anova(lmm)
+#table(df$change_sfd)
+#var(df$change_sfd,na.rm=T)/mean(df$change_sfd, na.rm=T)
+
+#ggplot(df, aes(x = change_sfd)) +
+#  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+#  labs(x = "Change in SFD", y = "Frequency") +
+#  scale_x_continuous(breaks = -14:14) +
+#  theme_minimal()
+
+shapiro.test(df$sfd_6mo) #reject normality
+
+lmm0 = glmmTMB(sfd~time*group+(1|school/id), data=data)
+summary(lmm0)
+lmm1= glmmTMB(sfd~time+(1|school/id), data)
+summary(lmm1)
+anova(lmm0,lmm1)
+
+dat <- data %>% drop_na() %>% 
+  mutate(sd = 14-sfd)
+
+```
+
+# count model comparison
+## cross-sectional
+```{r}
+dd <- dat %>%
+  group_by(id) %>%
+  mutate(base = first(sfd[time == 1])) %>%
+  ungroup()
+
+ddd6 <- dd %>% filter(time == 2)
+
+## Negative‑binomial (NB)
+m_nb <- glmmTMB(
+  sfd ~ group+base,
+  family = nbinom2,  data = ddd6)
+
+## Beta‑binomial (BB)
+m_bb <- glmmTMB(
+  cbind(sfd, 14-sfd) ~ group+base,
+  family = betabinomial, data = ddd6)
+
+## Zero‑inflated NB
+m_zinb <- glmmTMB(
+  sfd ~ group+base,
+  ziformula = ~., family = nbinom2, ddd6)
+
+## Zero‑inflated Beta‑binomial
+m_zibb <- glmmTMB(
+  cbind(sfd, 14-sfd) ~ group+base,
+  ziformula = ~1, family = betabinomial, data = ddd6)
+
+AIC(m_nb, m_bb, m_zinb, m_zibb) %>% 
+  as_tibble(rownames = "model") %>% 
+  arrange(AIC)
+
+summary(m_bb)
+```
+
+## longitudinal
+```{r}
+## Negative‑binomial (NB)
+m_nb <- glmmTMB(
+  sd ~ time*group + (1|school/id),
+  family = nbinom2,  data = dat)
+
+## Beta‑binomial (BB)
+m_bb <- glmmTMB(
+  cbind(sd, 14-sd) ~ time*group + (1|school/id),
+  family = betabinomial, data = dat)
+
+## Zero‑inflated NB
+m_zinb <- glmmTMB(
+  sd ~ time*group + (1|school/id),
+  ziformula = ~., family = nbinom2, dat)
+
+## Zero‑inflated Beta‑binomial
+m_zibb <- glmmTMB(
+  cbind(sd, 14-sd) ~ time*group + (1|school/id),
+  ziformula = ~1, family = betabinomial, data = dat)
+
+AIC(m_nb, m_bb, m_zinb, m_zibb) %>% 
+  as_tibble(rownames = "model") %>% 
+  arrange(AIC)
+
+clr  <- c("Neg Bin" = "black",
+          "Beta Bin" = "grey50",
+          "ZINB"   = "blue",
+          "ZIBB"= "red")
+
+lt   <- c("Neg Bin" = "solid",
+          "Beta Bin" = "solid",
+          "ZINB"    = "dashed",
+          "ZIBB" = "dashed")
+
+
+B <- 1000                                       
+
+avg_sim_pct <- function(fit, label, B = 1000) {
+  sims_mat <- simulate(fit, nsim = B)          
+  sims_vec <- as.vector(as.matrix(sims_mat))  
+
+  tibble(sd = sims_vec) %>%
+    filter(sd <= 14, sd >= 0) %>% 
+    count(sd) %>%                            
+    complete(sd = 0:14, fill = list(n = 0)) %>%
+    mutate(
+      pct   = 100 * n / length(sims_vec), 
+      model = label
+    )
+}
+
+
+sim_all <- bind_rows(
+  avg_sim_pct(m_nb, "Neg Bin", B),
+  avg_sim_pct(m_bb, "Beta Bin", B),
+  avg_sim_pct(m_zinb, "ZINB", B),
+  avg_sim_pct(m_zibb, "ZIBB", B)
+)
+
+ggplot() +
+  geom_col(data = dat %>% count(sd),
+           aes(x = sd, y = 100 * n / sum(n)), fill = "grey80", colour = NA, width = 1, alpha = .8) +
+  geom_line(data = sim_all,
+            aes(x = sd, y = pct, colour = model, linetype = model, group = model),
+            linewidth = .9, direction = "mid") +
+
+  scale_colour_manual(name = NULL, values = clr) +
+  scale_linetype_manual(name = NULL, values = lt) +
+
+  labs(x = "Number of SD in past 14 days", y = "Percent of SD") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = c(.85, .85))
+
+```
+
+
+```{r}
+summary(m_bb)
+
+library(emmeans)
+emmeans(m_bb, pairwise ~ group | time) #estimate
+emmeans(m_bb, pairwise ~ group | time, type = "response") #odds ratio
+
+vc_list <- VarCorr(m_bb)$cond
+
+var_components <- sapply(vc_list, function(mat)
+                         (attr(mat, "stddev"))^2)
+
+var_school <- var_components[2]
+var_subject  <- var_components[1]
+
+
+# Approximate residual variance for beta-binomial (as binomial variance × φ)
+# For binomial: Var(Y) = n * p * (1 - p)
+# For beta-binomial: Var(Y) = n * p * (1 - p) * (1 + (n - 1) * φ)
+# => overdispersion increases residual variance
+
+# We approximate residual variance on the latent scale as:
+# (following glmm practice for latent variance in logit models)
+var_resid <- (pi^2) / 3  # Latent scale approximation for logit link
+
+# Total variance = sum of random effects + residual
+var_total <- var_school + var_subject + var_resid
+
+# ICC for school level (proportion of total variance from school)
+icc_school <- var_school / var_total
+
+# ICC for subject level (repeatability)
+icc_subject <- var_subject / var_total
+
+# Print
+cat("ICC_school: ", round(icc_school, 4), "\n")
+cat("ICC_subject: ", round(icc_subject, 4), "\n")
+
+```
+
+```{r}
+ggplot(dat, aes(x = time, y = sd, group = id, colour = school)) +
+  geom_line(alpha = 0.3) +
+  stat_summary(aes(group = group), fun = mean,
+               geom = "line", linewidth = 1, colour = "black") +
+  scale_x_discrete(labels = c("Baseline", "6 month", "12 month")) +
+  labs(x = NULL, y = "Symptom Days (14–SFD)",
+       subtitle = "Colour = school; bold = group means") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+###############################################################################
+##  3.  Sample‑size for 30‑school cluster‑RCT                               ##
+###############################################################################
+## Target: detect ≥ 1/3 SD improvement at ANY of the 4 follow‑ups with 80% power
+alpha_one_sided   <- 0.0125                # Bonferroni for 4 comparisons (0.05/4)
+z_alpha <- qnorm(1 - alpha_one_sided/2)
+z_beta  <- qnorm(0.80)
+delta <- 1/3
+## 3‑b  Independent‑samples size (no clustering, no repeated measures)
+n <- 2 * (z_alpha + z_beta)^2 / delta^2 
+c <- 30 # number of clusters
+m_r <- 4 # number of repeated measures
+# Design effect:
+DE <- function(m)  1 + (m - 1) * icc_school + (1 + (m_r - 1) * icc_subject) / m_r
+m_seq <- 1:100
+m_star <- m_seq[ which( c * m_seq >= DE(m_seq) * n )[1] ]
+
+cat("=> Need", m_star, "children per school (total 30 x",
+    m_star, "=", 30*m_star, ")\n")
+```
+
+
